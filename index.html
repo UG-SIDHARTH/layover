@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flight Path Jukebox</title>
+    <!-- CDN fallback: <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script> -->
+    <script src="./tone.js"></script>
+    <style>
+        :root {
+            --bg: #050a1f;
+            --accent1: #ff6b35; /* Orange */
+            --accent2: #00f0ff; /* Electric Blue */
+            --ui-bg: rgba(5, 10, 31, 0.85);
+        }
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: var(--bg); color: #fff;
+            font-family: 'Courier New', Courier, monospace; 
+            overflow: hidden; user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        h1 {
+            font-family: "Arial Black", Impact, sans-serif;
+            font-size: clamp(2.5rem, 6vw, 4rem);
+            margin: 0; text-transform: uppercase;
+            color: var(--accent1); letter-spacing: 2px;
+            line-height: 1.1;
+        }
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 10;
+        }
+        .screen {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: auto;
+            background: var(--ui-bg); backdrop-filter: blur(8px);
+            padding: 40px; border-radius: 16px;
+            text-align: center; border: 2px solid var(--accent2);
+            box-shadow: 0 0 30px rgba(0, 240, 255, 0.2);
+            transition: opacity 0.4s ease, transform 0.4s ease;
+            width: 85%; max-width: 400px;
+        }
+        .hidden { 
+            opacity: 0; pointer-events: none; 
+            transform: translate(-50%, -45%);
+        }
+        .tagline { 
+            font-size: 1.1rem; margin: 15px 0 35px; color: var(--accent2); 
+        }
+        button {
+            font-family: "Arial Black", Impact, sans-serif;
+            background: var(--accent2); color: var(--bg);
+            border: none; padding: 20px 40px; font-size: 1.5rem;
+            border-radius: 50px; cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 240, 255, 0.4);
+            transition: transform 0.1s, box-shadow 0.2s;
+            width: 100%; max-width: 280px;
+        }
+        button:hover { box-shadow: 0 0 35px rgba(0, 240, 255, 0.8); }
+        button:active { transform: scale(0.95); }
+        
+        #error-msg { color: var(--accent1); margin-top: 20px; font-size: 0.9rem; font-weight: bold;}
+        #stats { font-size: 1.2rem; margin: 20px 0 30px; line-height: 1.6; color: #ddd; }
+        #canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <!-- UI LAYER -->
+    <div id="ui-layer">
+        <div id="start-screen" class="screen">
+            <h1>FLIGHT PATH<br>JUKEBOX</h1>
+            <p class="tagline">Every journey has a soundtrack.</p>
+            <button id="btn-start">TAKE OFF</button>
+            <div id="error-msg"></div>
+        </div>
+        
+        <div id="end-screen" class="screen hidden">
+            <h1>TOUCHDOWN</h1>
+            <p id="stats"></p>
+            <button id="btn-restart">FLY AGAIN</button>
+        </div>
+    </div>
+
+    <!-- VISUALS LAYER -->
+    <canvas id="canvas"></canvas>
+
+    <script>
+        // ==========================================
+        // CONFIGURATION
+        // ==========================================
+        const CONFIG = {
+            duration: 60, // Total flight time in seconds
+            colors: {
+                bg: '#050a1f',
+                land: '#0a1433',
+                route: 'rgba(0, 240, 255, 0.2)',
+                routeGlow: '#00f0ff',
+                accentOrange: '#ff6b35'
+            },
+            audio: {
+                mohanam: ['C4', 'D4', 'E4', 'G4', 'A4', 'C5', 'D5', 'E5', 'G5', 'A5'], // India
+                hijaz:   ['C4', 'Db4', 'E4', 'F4', 'G4', 'Ab4', 'Bb4', 'C5', 'Db5', 'E5'], // Arabia
+                droneNote: 'C2',
+                tempo: "8n" 
+            },
+            turbulencePoints: [0.35, 0.65, 0.75], // At 35%, 65%, 75% of the trip
+            turbulenceDuration: 0.04 
+        };
+
+        // ==========================================
+        // STATE & MATH UTILS
+        // ==========================================
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
+        let w, h;
+        let isPlaying = false;
+        let startTime = 0;
+        let visualPulse = 0; // Decays over time, spiked by audio notes
+
+        function resize() {
+            w = window.innerWidth;
+            h = window.innerHeight;
+            canvas.width = w * window.devicePixelRatio;
+            canvas.height = h * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function getAltitude(t) {
+            if (t < 0.2) return t / 0.2; // Climb
+            if (t > 0.8) return (1 - t) / 0.2; // Descent
+            return 1; // Cruise
+        }
+
+        function getTurbulence(t) {
+            for (let p of CONFIG.turbulencePoints) {
+                if (t >= p && t <= p + CONFIG.turbulenceDuration) {
+                    let intensity = Math.sin(((t - p) / CONFIG.turbulenceDuration) * Math.PI);
+                    return (Math.random() - 0.5) * 0.15 * intensity;
+                }
+            }
+            return 0;
+        }
+
+        function getRoutePoints() {
+            return {
+                p0: { x: w * 0.85, y: h * 0.8 },  // CCJ (Kozhikode)
+                p1: { x: w * 0.5,  y: h * 0.35 }, // Curved control point over sea
+                p2: { x: w * 0.15, y: h * 0.2 }   // DXB (Dubai)
+            };
+        }
+
+        function getBezier(t, p0, p1, p2) {
+            let x = Math.pow(1-t, 2)*p0.x + 2*(1-t)*t*p1.x + Math.pow(t, 2)*p2.x;
+            let y = Math.pow(1-t, 2)*p0.y + 2*(1-t)*t*p1.y + Math.pow(t, 2)*p2.y;
+            return {x, y};
+        }
+
+        function getBezierDeriv(t, p0, p1, p2) {
+            let dx = 2*(1-t)*(p1.x-p0.x) + 2*t*(p2.x-p1.x);
+            let dy = 2*(1-t)*(p1.y-p0.y) + 2*t*(p2.y-p1.y);
+            return {dx, dy};
+        }
+
+        // ==========================================
+        // AUDIO (Tone.js)
+        // ==========================================
+        let audioInited = false;
+        let synth, drone, reverb, tremolo, loop;
+
+        async function initAudio() {
+            if (audioInited) return;
+            if (!window.Tone) throw new Error("Tone.js missing");
+            
+            reverb = new Tone.Reverb({ decay: 5, wet: 0.6 }).toDestination();
+            tremolo = new Tone.Tremolo(8, 0.9).connect(reverb).start();
+            
+            synth = new Tone.PolySynth(Tone.Synth, {
+                oscillator: { type: "triangle" },
+                envelope: { attack: 0.05, decay: 0.2, sustain: 0.3, release: 1.5 }
+            }).connect(tremolo);
+            
+            drone = new Tone.Synth({
+                oscillator: { type: "sawtooth" },
+                envelope: { attack: 3, sustain: 1, release: 4 }
+            }).connect(reverb);
+            
+            synth.volume.value = -8;
+            drone.volume.value = -18;
+            audioInited = true;
+        }
+
+        function startMusic() {
+            drone.triggerAttack(CONFIG.audio.droneNote, Tone.now());
+            
+            loop = new Tone.Loop((time) => {
+                let t = (Date.now() - startTime) / (CONFIG.duration * 1000);
+                if (t >= 1) return;
+                
+                let alt = getAltitude(t);
+                let isTurb = getTurbulence(t) !== 0;
+                
+                // Turbulence Audio FX
+                tremolo.wet.rampTo(isTurb ? 1 : 0, 0.1, time);
+                synth.detune.rampTo(isTurb ? (Math.random()-0.5)*150 : 0, 0.1, time);
+                drone.detune.rampTo(isTurb ? (Math.random()-0.5)*50 : 0, 0.1, time);
+                
+                // Scale selection (Blend in the middle)
+                let scale = t < 0.5 ? CONFIG.audio.mohanam : CONFIG.audio.hijaz;
+                if (t > 0.45 && t < 0.55) {
+                    scale = Math.random() > 0.5 ? CONFIG.audio.hijaz : CONFIG.audio.mohanam;
+                }
+                
+                // Map Altitude to Pitch
+                let maxNote = scale.length - 1;
+                let noteIndex = Math.floor(alt * maxNote);
+                
+                // Add slight melody variation
+                let variation = Math.floor((Math.random() - 0.5) * 4);
+                noteIndex = Math.max(0, Math.min(maxNote, noteIndex + variation));
+                
+                // Generative Rhythm (play sparse high notes during cruise)
+                let skipChance = alt > 0.9 ? 0.3 : 0.1;
+                
+                if (Math.random() > skipChance) {
+                    let note = scale[noteIndex];
+                    let duration = alt > 0.8 ? "4n" : "8n";
+                    synth.triggerAttackRelease(note, duration, time);
+                    
+                    // Sync visuals to EXACT audio time
+                    Tone.Draw.schedule(() => { visualPulse = 1.0; }, time);
+                }
+            }, CONFIG.audio.tempo);
+            
+            Tone.Transport.bpm.value = 110;
+            Tone.Transport.start();
+            loop.start(0);
+        }
+
+        function stopMusic() {
+            drone.triggerRelease(Tone.now());
+            synth.releaseAll();
+            loop.stop();
+            Tone.Transport.stop();
+            // Landing soft final chord
+            synth.triggerAttackRelease(["C3", "G3", "C4"], "2m", Tone.now());
+        }
+
+        // ==========================================
+        // MAP & ANIMATION
+        // ==========================================
+        function drawMap(ctx) {
+            ctx.fillStyle = CONFIG.colors.land;
+            
+            // Abstract India
+            ctx.beginPath();
+            ctx.moveTo(w, h * 0.3);
+            ctx.bezierCurveTo(w * 0.8, h * 0.5, w * 0.7, h * 0.7, w * 0.5, h);
+            ctx.lineTo(w, h);
+            ctx.fill();
+
+            // Abstract Arabia
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(w * 0.5, 0);
+            ctx.bezierCurveTo(w * 0.35, h * 0.2, w * 0.1, h * 0.4, 0, h * 0.6);
+            ctx.fill();
+
+            let pts = getRoutePoints();
+
+            // Draw Cities
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 16px Courier New';
+            ctx.fillText("DXB", pts.p2.x - 45, pts.p2.y - 10);
+            ctx.fillText("CCJ", pts.p0.x + 15, pts.p0.y + 15);
+
+            // Base Dim Route Line
+            ctx.beginPath();
+            ctx.moveTo(pts.p0.x, pts.p0.y);
+            ctx.quadraticCurveTo(pts.p1.x, pts.p1.y, pts.p2.x, pts.p2.y);
+            ctx.strokeStyle = CONFIG.colors.route;
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 6]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        function drawProgressTrail(ctx, t, pts) {
+            ctx.beginPath();
+            ctx.moveTo(pts.p0.x, pts.p0.y);
+            for (let i = 0.01; i <= t; i += 0.01) {
+                let p = getBezier(i, pts.p0, pts.p1, pts.p2);
+                ctx.lineTo(p.x, p.y);
+            }
+            // Ensure trail reaches exact current position
+            let finalP = getBezier(t, pts.p0, pts.p1, pts.p2);
+            ctx.lineTo(finalP.x, finalP.y);
+
+            ctx.strokeStyle = CONFIG.colors.routeGlow;
+            ctx.lineWidth = 3 + (visualPulse * 2);
+            ctx.lineCap = 'round';
+            ctx.shadowBlur = 15 * visualPulse;
+            ctx.shadowColor = CONFIG.colors.routeGlow;
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+        }
+
+        function drawPlane(ctx, t, pts) {
+            let p = getBezier(t, pts.p0, pts.p1, pts.p2);
+            let d = getBezierDeriv(t, pts.p0, pts.p1, pts.p2);
+            let angle = Math.atan2(d.dy, d.dx);
+            
+            ctx.save();
+            ctx.translate(p.x, p.y);
+            let scale = 1 + (visualPulse * 0.2); // Pulse to beat
+            ctx.scale(scale, scale);
+            ctx.rotate(angle);
+            
+            // Draw simple geometric plane
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.moveTo(12, 0);   // Nose
+            ctx.lineTo(-10, -10); // Left wing
+            ctx.lineTo(-6, 0);    // Tail
+            ctx.lineTo(-10, 10);  // Right wing
+            ctx.closePath();
+            
+            ctx.shadowBlur = 20 * visualPulse;
+            ctx.shadowColor = CONFIG.colors.routeGlow;
+            ctx.fill();
+            ctx.restore();
+        }
+
+        function drawAltitudeGraph(ctx, t) {
+            const margin = 30;
+            const graphH = 60;
+            const base = h - margin;
+            const graphW = w - (margin * 2);
+            
+            // Ground line
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(margin, base);
+            ctx.lineTo(w - margin, base);
+            ctx.stroke();
+            
+            // Background ideal curve
+            ctx.beginPath();
+            for (let i = 0; i <= 1; i += 0.05) {
+                let x = margin + i * graphW;
+                let y = base - getAltitude(i) * graphH;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = 'rgba(255, 107, 53, 0.3)';
+            ctx.stroke();
+            
+            // Live actual progress (with bumps)
+            ctx.beginPath();
+            for (let i = 0; i <= t; i += 0.01) {
+                let alt = getAltitude(i) + getTurbulence(i);
+                let x = margin + i * graphW;
+                let y = base - Math.max(0, alt) * graphH;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = CONFIG.colors.accentOrange;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            // Live pulsing dot
+            let currentAlt = getAltitude(t) + getTurbulence(t);
+            let dotX = margin + t * graphW;
+            let dotY = base - Math.max(0, currentAlt) * graphH;
+            
+            ctx.beginPath();
+            ctx.arc(dotX, dotY, 4 + (visualPulse * 3), 0, Math.PI * 2);
+            ctx.fillStyle = CONFIG.colors.accentOrange;
+            ctx.shadowBlur = 12 * visualPulse;
+            ctx.shadowColor = CONFIG.colors.accentOrange;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        function animate() {
+            if (!isPlaying) return;
+            let t = (Date.now() - startTime) / (CONFIG.duration * 1000);
+            
+            // Decay the beat pulse
+            visualPulse = Math.max(0, visualPulse - 0.05); 
+            
+            // Clean slate
+            ctx.fillStyle = CONFIG.colors.bg;
+            ctx.fillRect(0, 0, w, h);
+            
+            ctx.save();
+            let turb = getTurbulence(t);
+            if (turb !== 0) {
+                let shake = turb * 40; // Screen Shake!
+                ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+            }
+            
+            drawMap(ctx);
+            let pts = getRoutePoints();
+            
+            if (t > 0) drawProgressTrail(ctx, Math.min(t, 1), pts);
+            if (t < 1) drawPlane(ctx, Math.max(0, t), pts);
+            drawAltitudeGraph(ctx, Math.min(t, 1));
+            
+            ctx.restore();
+            
+            if (t >= 1) {
+                endFlight();
+            } else {
+                requestAnimationFrame(animate);
+            }
+        }
+
+        // ==========================================
+        // UI & EVENT LISTENERS
+        // ==========================================
+        async function handleTakeOff() {
+            try {
+                await Tone.start();
+                await initAudio();
+                
+                document.getElementById('start-screen').classList.add('hidden');
+                document.getElementById('end-screen').classList.add('hidden');
+                
+                startTime = Date.now();
+                isPlaying = true;
+                visualPulse = 0;
+                
+                startMusic();
+                requestAnimationFrame(animate);
+            } catch (e) {
+                document.getElementById('error-msg').innerText = "Audio failed to load. Is tone.js in the same folder?";
+                console.error(e);
+            }
+        }
+
+        function endFlight() {
+            isPlaying = false;
+            stopMusic();
+            
+            let endScreen = document.getElementById('end-screen');
+            document.getElementById('stats').innerHTML = `Route: CCJ → DXB<br>Duration: ${CONFIG.duration}s`;
+            endScreen.classList.remove('hidden');
+        }
+
+        document.getElementById('btn-start').addEventListener('click', handleTakeOff);
+        document.getElementById('btn-restart').addEventListener('click', handleTakeOff);
+        
+        // Initial Background Render
+        ctx.fillStyle = CONFIG.colors.bg;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        drawMap(ctx);
+
+    </script>
+</body>
+</html>
